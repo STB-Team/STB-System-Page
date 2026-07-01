@@ -1,0 +1,24 @@
+# ---- Build output ----
+/build/
+/out/
+.vs/
+CMakeSettings.json
+CMakeUserPresets.json
+
+# vcpkg
+vcpkg_installed/
+
+# ---- Mod assets (not needed to build the plugin DLL) ----
+/Interf/
+/System_scripts/
+/samples/
+*.7z
+*.swf
+_swfdump.txt
+
+# ---- Tooling / editor / OS ----
+/.claude/
+CLAUDE.md
+Thumbs.db
+Desktop.ini
+*.user
