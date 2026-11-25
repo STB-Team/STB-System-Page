@@ -4,6 +4,12 @@ An SKSE plugin (`STB_SystemPage`) for Skyrim Special Edition. It reworks the Esc
 
 This repository contains the C++ source needed to build the plugin DLL.
 
+With Community Shaders' native Graphics tab or Native System Menu Framework, STB places its
+configured `settingsTabs` after the provider's tabs so their position-based shortcuts keep
+working. `priority` still orders the STB tabs relative to one another. Without either provider,
+the configured priority works against the vanilla tabs as before.
+The shared list expands to fit the tabs within the visible frame and scrolls if more space is needed.
+
 ## Requirements
 
 - **Visual Studio 2026** (v145 toolset) with the *Desktop development with C++* workload.
