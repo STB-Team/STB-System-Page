@@ -16,9 +16,20 @@ using namespace RE;
 namespace SystemMenuButton
 {
 	constexpr const char* kMenuRootPath = "_root.QuestJournalFader.Menu_mc";
+	constexpr const char* kCommunityShadersPage = "__cs_systemPage";
+	constexpr const char* kNativeFrameworkPage = "__nsmf_systemPage";
+	constexpr std::uint32_t kCommunityShadersGraphicsIndex = 3;
+
+	enum class SettingsOwner
+	{
+		kVanilla,
+		kCommunityShaders,
+		kNativeFramework
+	};
 
 	std::atomic<bool> g_injected{ false };
 	std::atomic<int>  g_injectTicks{ 0 };
+	std::atomic<bool> g_settingsPageSeen{ false };
 	std::atomic<int>  g_pendingEntry{ -1 };
 	std::atomic<int>  g_selectTicks{ 0 };
 	std::string       g_selectTarget;
@@ -114,7 +125,8 @@ namespace SystemMenuButton
 				return;
 
 			RE::GFxValue entry, sidx;
-			if (evt.GetMember("entry", &entry) && entry.GetMember("__stb_stidx", &sidx) && sidx.IsNumber()) {
+			const bool hasEntry = evt.IsObject() && evt.GetMember("entry", &entry) && entry.IsObject();
+			if (hasEntry && entry.GetMember("__stb_stidx", &sidx) && sidx.IsNumber()) {
 				const int idx = static_cast<int>(sidx.GetNumber());
 				if (idx < 0 || idx >= static_cast<int>(Config::settingsTabs.size()))
 					return;
@@ -152,8 +164,12 @@ namespace SystemMenuButton
 				return;
 			}
 
+			// У Community Shaders для своих строк уже есть отдельный обработчик itemPress.
+			if (a_params.thisPtr->HasMember("__stb_cs_settings"))
+				return;
+
 			RE::GFxValue svidx;
-			if (entry.GetMember("__stb_svidx", &svidx) && svidx.IsNumber()) {
+			if (hasEntry && entry.GetMember("__stb_svidx", &svidx) && svidx.IsNumber()) {
 				RE::GFxValue settingsList;
 				if (page.GetMember("SettingsList", &settingsList))
 					settingsList.SetMember("iSelectedIndex", svidx);
@@ -239,7 +255,7 @@ namespace SystemMenuButton
 		a_catList.SetMember("__stb_injected", RE::GFxValue(1.0));
 	}
 
-	void AddSettingsListener(RE::GFxMovieView* a_view, RE::GFxValue& a_list, RE::GFxValue& a_page)
+	void AddSettingsListener(RE::GFxMovieView* a_view, RE::GFxValue& a_list, RE::GFxValue& a_page, SettingsOwner a_owner)
 	{
 		RE::GFxValue scope;
 		a_view->CreateObject(&scope);
@@ -247,9 +263,12 @@ namespace SystemMenuButton
 		a_view->CreateFunction(&fn, &g_settingsPressHandler);
 		scope.SetMember("onSTBSettingsPress", fn);
 		scope.SetMember("__stb_page", a_page);
-
-		const RE::GFxValue rm[3] = { RE::GFxValue("itemPress"), a_page, RE::GFxValue("onSettingsCategoryPress") };
-		a_list.Invoke("removeEventListener", nullptr, rm, 3);
+		if (a_owner == SettingsOwner::kCommunityShaders) {
+			scope.SetMember("__stb_cs_settings", RE::GFxValue(true));
+		} else {
+			const RE::GFxValue rm[3] = { RE::GFxValue("itemPress"), a_page, RE::GFxValue("onSettingsCategoryPress") };
+			a_list.Invoke("removeEventListener", nullptr, rm, 3);
+		}
 		const RE::GFxValue add[3] = { RE::GFxValue("itemPress"), scope, RE::GFxValue("onSTBSettingsPress") };
 		a_list.Invoke("addEventListener", nullptr, add, 3);
 
@@ -422,27 +441,70 @@ namespace SystemMenuButton
 		return true;
 	}
 
-	bool InjectSettings(RE::GFxMovieView* a_view, RE::GFxValue& page)
+	void GrowExternalSettingsList(RE::GFxMovieView* view, RE::GFxValue& list, std::uint32_t count)
+	{
+		RE::GFxValue border, height, row, rowHeight;
+		if (!list.GetMember("border", &border) || !border.IsObject() ||
+			!border.GetMember("_height", &height) || !height.IsNumber() ||
+			!list.GetMember("Entry0", &row) || !row.IsObject() ||
+			!row.GetMember("_height", &rowHeight) || !rowHeight.IsNumber() || rowHeight.GetNumber() <= 0.0)
+			return;
+
+		RE::GFxValue point, y;
+		view->CreateObject(&point);
+		const auto stageY = [&](double localY, double& result) {
+			point.SetMember("x", RE::GFxValue(0.0));
+			point.SetMember("y", RE::GFxValue(localY));
+			if (!list.Invoke("localToGlobal", nullptr, &point, 1) ||
+				!point.GetMember("y", &y) || !y.IsNumber())
+				return false;
+			result = y.GetNumber();
+			return true;
+		};
+		const double rowSize = rowHeight.GetNumber();
+		double top, next;
+		if (!stageY(0.0, top) || !stageY(rowSize, next) || next <= top)
+			return;
+
+		// Как у Community Shaders: оставляем снизу такой же отступ, как сверху.
+		// Переводим доступную высоту сцены обратно в координаты списка.
+		const auto frame = view->GetVisibleFrameRect();
+		const double available = (static_cast<double>(frame.bottom) + frame.top - 2.0 * top) *
+			rowSize / (next - top);
+		const double grown = (std::min)(rowSize * count + 0.5, available);
+		if (grown > height.GetNumber())
+			border.SetMember("_height", RE::GFxValue(grown));
+	}
+
+	bool InjectSettings(RE::GFxMovieView* a_view, RE::GFxValue& page, SettingsOwner a_owner)
 	{
 		RE::GFxValue list;
-		if (!page.GetMember("SettingsList", &list) || !list.IsObject())
+		const bool external = a_owner != SettingsOwner::kVanilla;
+		if (external) {
+			RE::GFxValue panel;
+			if (!page.GetMember("SettingsPanel", &panel) || !panel.IsObject() ||
+				!panel.GetMember("List_mc", &list) || !list.IsObject())
+				return false;
+		} else if (!page.GetMember("SettingsList", &list) || !list.IsObject()) {
 			return false;
+		}
 
 		RE::GFxValue entryList;
 		if (!list.GetMember("entryList", &entryList) || !entryList.IsArray())
 			return false;
-		if (entryList.GetArraySize() == 0)
+		const auto baseCount = entryList.GetArraySize();
+		if (baseCount == 0)
 			return false;
 
-		if (list.HasMember("__stb_set_injected"))
+		if (entryList.HasMember("__stb_set_entries"))
 			return true;
 
-		const auto vanillaCount = entryList.GetArraySize();
-		for (std::uint32_t i = 0; i < vanillaCount; ++i) {
-			RE::GFxValue e;
-			if (entryList.GetElement(i, &e))
-				e.SetMember("__stb_svidx", RE::GFxValue(static_cast<double>(i)));
-		}
+		// Оба провайдера определяют вкладку по позиции. Добавляем свои строки
+		// только после того, как провайдер закончил формировать начало списка.
+		if (a_owner == SettingsOwner::kCommunityShaders && baseCount <= kCommunityShadersGraphicsIndex)
+			return false;
+		if (a_owner == SettingsOwner::kNativeFramework && !list.HasMember("__nsmf_fullTabs"))
+			return false;
 
 		struct Item
 		{
@@ -450,37 +512,57 @@ namespace SystemMenuButton
 			RE::GFxValue val;
 		};
 		std::vector<Item> items;
-		items.reserve(vanillaCount + Config::settingsTabs.size());
+		items.reserve(Config::settingsTabs.size() + (external ? 0 : baseCount));
 
 		for (std::size_t k = 0; k < Config::settingsTabs.size(); ++k) {
 			RE::GFxValue entry;
 			a_view->CreateObject(&entry);
 			entry.SetMember("text", RE::GFxValue(Config::settingsTabs[k].text.c_str()));
 			entry.SetMember("__stb_stidx", RE::GFxValue(static_cast<double>(k)));
-			items.push_back({ Config::settingsTabs[k].priority, entry });
+			// При повторном открытии NSMF берет только строки без этого признака
+			// за ванильную основу. Иначе вкладки STB попадут туда и продублируются.
+			if (a_owner == SettingsOwner::kNativeFramework)
+				entry.SetMember("__nsmf_customTab", RE::GFxValue(true));
+			items.push_back({ Config::settingsTabs[k].priority, std::move(entry) });
 		}
-		for (std::uint32_t i = 0; i < vanillaCount; ++i) {
-			RE::GFxValue e;
-			if (entryList.GetElement(i, &e))
-				items.push_back({ static_cast<int>(vanillaCount - i), e });
+		if (!external) {
+			for (std::uint32_t i = 0; i < baseCount; ++i) {
+				RE::GFxValue e;
+				if (entryList.GetElement(i, &e) && e.IsObject()) {
+					e.SetMember("__stb_svidx", RE::GFxValue(static_cast<double>(i)));
+					items.push_back({ static_cast<int>(baseCount - i), std::move(e) });
+				}
+			}
 		}
 
 		std::stable_sort(items.begin(), items.end(),
 			[](const Item& a, const Item& b) { return a.prio > b.prio; });
 
-		const RE::GFxValue clr[2] = { RE::GFxValue(0.0), RE::GFxValue(static_cast<double>(entryList.GetArraySize())) };
-		entryList.Invoke("splice", nullptr, clr, 2);
+		if (!external) {
+			const RE::GFxValue clr[2] = { RE::GFxValue(0.0), RE::GFxValue(static_cast<double>(baseCount)) };
+			entryList.Invoke("splice", nullptr, clr, 2);
+		}
 		for (auto& it : items)
 			entryList.Invoke("push", nullptr, &it.val, 1);
 
 		const std::uint32_t total = entryList.GetArraySize();
-		EnsureRowClips(a_view, list, total, true);
+		EnsureRowClips(a_view, list, total, !external);
+		if (external)
+			GrowExternalSettingsList(a_view, list, total);
 
 		list.Invoke("InvalidateData");
 
-		AddSettingsListener(a_view, list, page);
-		logger::info("SystemMenuButton: injected {} settings tab(s); list total {}",
-			Config::settingsTabs.size(), total);
+		if (external) {
+			list.Invoke("CalculateMaxScrollPosition");
+			list.Invoke("UpdateList");
+		}
+		entryList.SetMember("__stb_set_entries", RE::GFxValue(true));
+		if (!list.HasMember("__stb_set_injected"))
+			AddSettingsListener(a_view, list, page, a_owner);
+		const char* ownerName = a_owner == SettingsOwner::kCommunityShaders ? "Community Shaders" :
+			a_owner == SettingsOwner::kNativeFramework ? "Native System Menu Framework" : "vanilla";
+		logger::info("SystemMenuButton: injected {} settings tab(s); list total {}; owner: {}",
+			Config::settingsTabs.size(), total, ownerName);
 		return true;
 	}
 
@@ -499,11 +581,20 @@ namespace SystemMenuButton
 		if (!FindByPredicate(root, IsSystemPage, page, 10))
 			return false;
 
-		if (needCat && !InjectCategory(a_view, page))
+		if (!needSet)
+			return !needCat || InjectCategory(a_view, page);
+
+		// Оба внешних хука ищут ту же страницу в цепочке AdvanceMovie.
+		// Даем закончиться первому проходу независимо от порядка хуков.
+		if (!g_settingsPageSeen.exchange(true))
 			return false;
-		if (needSet && !InjectSettings(a_view, page))
+		const auto owner = root.HasMember(kCommunityShadersPage) ? SettingsOwner::kCommunityShaders :
+			root.HasMember(kNativeFrameworkPage) ? SettingsOwner::kNativeFramework : SettingsOwner::kVanilla;
+		const bool settingsReady = InjectSettings(a_view, page, owner);
+		if (owner == SettingsOwner::kNativeFramework && !settingsReady)
 			return false;
-		return true;
+		const bool categoryReady = !needCat || InjectCategory(a_view, page);
+		return settingsReady && categoryReady;
 	}
 
 	bool TrySelectMod(RE::GFxMovieView* a_view)
@@ -686,6 +777,7 @@ namespace SystemMenuButton
 		{
 			if (a_event && std::string_view(a_event->menuName.c_str()) == RE::JournalMenu::MENU_NAME) {
 				g_injected.store(false);
+				g_settingsPageSeen.store(false);
 				g_pendingEntry.store(-1);
 				g_selectTicks.store(0);
 				g_selectTarget.clear();
